@@ -1,0 +1,21 @@
+[package]
+name = "esquima-kiosk"
+version = "0.1.0"
+description = "ESQUIMA Kiosk Application"
+authors = ["ESQUIMA"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.57"
+
+[build-dependencies]
+tauri-build = { version = "1.5.1", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tauri = { version = "1.5.4", features = ["system-tray", "shell-open", "shell-execute", "shell-sidecar", "fs-all", "window-all", "process-all"] }
+tauri-plugin-autostart = "0.2.0"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"] 
