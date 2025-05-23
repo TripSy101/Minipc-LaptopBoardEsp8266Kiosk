@@ -9,6 +9,20 @@ use tauri::{
 };
 use tauri_plugin_autostart::MacosLauncher;
 use std::process::Command;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tauri::State;
+
+mod hardware;
+mod database;
+
+use hardware::{HardwareManager, ServiceConfig};
+use database::{Database, Service};
+
+struct AppState {
+    hardware: Arc<HardwareManager>,
+    database: Arc<Database>,
+}
 
 // Command to handle system power management
 #[tauri::command]
@@ -73,7 +87,53 @@ async fn toggle_system_tray(window: tauri::Window) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn get_services(state: State<'_, AppState>) -> Result<Vec<Service>, String> {
+    state.database.get_services().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn add_service(
+    state: State<'_, AppState>,
+    service: Service,
+) -> Result<(), String> {
+    state.database.add_service(&service).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_service(
+    state: State<'_, AppState>,
+    service: Service,
+) -> Result<(), String> {
+    state.database.update_service(&service).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_service(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    state.database.delete_service(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn backup_database(
+    state: State<'_, AppState>,
+    backup_path: PathBuf,
+) -> Result<(), String> {
+    state.database.backup(&backup_path).map_err(|e| e.to_string())
+}
+
 fn main() {
+    let hardware = Arc::new(HardwareManager::new());
+    let database = Arc::new(Database::new(PathBuf::from("kiosk.db").as_ref())
+        .expect("Failed to initialize database"));
+
+    let state = AppState {
+        hardware,
+        database,
+    };
+
     // Create system tray menu
     let quit = CustomMenuItem::new("quit".to_string(), "Quit");
     let hide = CustomMenuItem::new("hide".to_string(), "Hide");
@@ -87,6 +147,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--flag1", "--flag2"])))
         .system_tray(system_tray)
+        .manage(state)
         .on_system_tray_event(|app, event| match event {
             SystemTrayEvent::MenuItemClick { id, .. } => {
                 match id.as_str() {
@@ -109,7 +170,12 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             handle_power_action,
             handle_display_power,
-            toggle_system_tray
+            toggle_system_tray,
+            get_services,
+            add_service,
+            update_service,
+            delete_service,
+            backup_database,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
