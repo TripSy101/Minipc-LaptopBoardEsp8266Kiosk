@@ -4,36 +4,33 @@ import sys
 import json
 import time
 import logging
+import logging.config
 import threading
 import sqlite3
+from typing import Optional, Dict, Any, List, Union
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+from usb_manager import monitor_usb_devices
+from serial_manager import SerialManager
+from config import LOG_SETTINGS, APP_SETTINGS
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from backend.serial_manager import (
-    SerialManager, setup_database, get_services, get_logs, 
+from backend.database import (
+    setup_database, get_services, get_logs, 
     update_service, get_setting, update_setting
 )
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "app.log")),
-        logging.StreamHandler()
-    ]
-)
-
-logger = logging.getLogger("esquima-server")
+logging.config.dictConfig(LOG_SETTINGS)
+logger = logging.getLogger(__name__)
 
 # Create logs directory if it doesn't exist
 os.makedirs(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs"), exist_ok=True)
 
 # Global variables
-serial_manager = SerialManager()
-messages = []
+serial_manager: Optional[SerialManager] = None
+messages: List[str] = []
 
 class ESPControlHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
@@ -91,9 +88,9 @@ class ESPControlHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 
                 status = {
-                    'connected': serial_manager.connected,
-                    'last_message': serial_manager.get_last_message(),
-                    'port': serial_manager.port
+                    'connected': serial_manager.connected if serial_manager else False,
+                    'last_message': serial_manager.get_last_message() if serial_manager else None,
+                    'port': serial_manager.port if serial_manager else None
                 }
                 self.wfile.write(json.dumps(status).encode())
             
@@ -135,6 +132,14 @@ class ESPControlHandler(BaseHTTPRequestHandler):
             
             # Send command to ESP8266
             if path == '/api/esp/command':
+                if not serial_manager:
+                    self.send_response(500)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'error': 'Serial manager not initialized'}).encode())
+                    return
+
                 command = data.get('command', '')
                 if not command:
                     self.send_response(400)
@@ -150,7 +155,7 @@ class ESPControlHandler(BaseHTTPRequestHandler):
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 
-                response = {'success': success}
+                response: Dict[str, Union[bool, str]] = {'success': success}
                 if not success:
                     response['error'] = 'Failed to send command'
                 
@@ -210,12 +215,28 @@ class ESPControlHandler(BaseHTTPRequestHandler):
             
             # Connect to ESP8266
             elif path == '/api/esp/connect':
+                global serial_manager
+                if not serial_manager:
+                    self.send_response(500)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'error': 'Serial manager not initialized'}).encode())
+                    return
+
                 port = data.get('port')
                 baudrate = data.get('baudrate', 9600)
                 
                 if port:
-                    serial_manager.port = port
-                    serial_manager.baudrate = baudrate
+                    try:
+                        serial_manager = SerialManager(port=port, baudrate=baudrate)
+                    except Exception as e:
+                        self.send_response(500)
+                        self.send_header('Content-Type', 'application/json')
+                        self.send_header('Access-Control-Allow-Origin', '*')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': f'Failed to initialize serial manager: {e}'}).encode())
+                        return
                 
                 success = serial_manager.connect()
                 self.send_response(200 if success else 500)
@@ -223,7 +244,7 @@ class ESPControlHandler(BaseHTTPRequestHandler):
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 
-                response = {'success': success}
+                response: Dict[str, Union[bool, str]] = {'success': success}
                 if not success:
                     response['error'] = 'Failed to connect to ESP8266'
                 
@@ -231,6 +252,14 @@ class ESPControlHandler(BaseHTTPRequestHandler):
             
             # Disconnect from ESP8266
             elif path == '/api/esp/disconnect':
+                if not serial_manager:
+                    self.send_response(500)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'error': 'Serial manager not initialized'}).encode())
+                    return
+
                 serial_manager.disconnect()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
@@ -255,47 +284,70 @@ class ESPControlHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({'error': str(e)}).encode())
 
-def message_callback(message):
-    """Callback function for messages from ESP8266"""
+def message_callback(message: str) -> None:
+    """Callback function for handling incoming serial messages"""
     global messages
     messages.append(message)
     # Keep only the last 100 messages
     if len(messages) > 100:
         messages = messages[-100:]
 
-def run_server(port=8000):
-    """Run the HTTP server"""
-    server_address = ('', port)
-    httpd = HTTPServer(server_address, ESPControlHandler)
-    logger.info(f"Starting server on port {port}")
-    httpd.serve_forever()
+def handle_usb_event(action: str, device_node: str) -> None:
+    """Handle USB device events"""
+    global serial_manager
+    if not serial_manager:
+        return
 
-def main():
+    if action == 'add':
+        # Try to connect to the new device
+        try:
+            serial_manager = SerialManager(port=device_node, baudrate=115200)
+            if serial_manager.connect():
+                logger.info(f"Connected to new device: {device_node}")
+        except Exception as e:
+            logger.error(f"Failed to connect to device {device_node}: {e}")
+    elif action == 'remove':
+        # Disconnect if the removed device was our current port
+        if serial_manager.port == device_node:
+            serial_manager.disconnect()
+            logger.info(f"Disconnected from removed device: {device_node}")
+
+def health_check() -> None:
+    """Periodic health check of the serial connection"""
+    global serial_manager
+    if not serial_manager:
+        return
+
+    if not serial_manager.connected:
+        logger.warning("Serial connection lost, attempting to reconnect...")
+        serial_manager.connect()
+
+def run_server(port: int = 8000) -> None:
+    """Run the HTTP server"""
+    server = HTTPServer(('', port), ESPControlHandler)
+    logger.info(f"Server running on port {port}")
+    server.serve_forever()
+
+def main() -> None:
     """Main function"""
-    # Setup database
-    setup_database()
+    global serial_manager
     
-    # Set callback for ESP8266 messages
+    # Initialize serial manager
+    serial_manager = SerialManager(port='', baudrate=115200)
     serial_manager.set_callback(message_callback)
     
-    # Try to connect to ESP8266
-    if not serial_manager.connect():
-        logger.warning("Failed to connect to ESP8266. Will retry in background.")
+    # Start USB monitoring in a separate thread
+    usb_thread = threading.Thread(target=monitor_usb_devices, args=(handle_usb_event,))
+    usb_thread.daemon = True
+    usb_thread.start()
     
-    # Start HTTP server
-    server_thread = threading.Thread(target=run_server)
-    server_thread.daemon = True
-    server_thread.start()
+    # Start health check in a separate thread
+    health_thread = threading.Thread(target=lambda: [time.sleep(30), health_check()])
+    health_thread.daemon = True
+    health_thread.start()
     
-    try:
-        # Keep main thread alive
-        while True:
-            time.sleep(1)
-    
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-        serial_manager.disconnect()
-        sys.exit(0)
+    # Run the server
+    run_server()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

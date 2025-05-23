@@ -7,125 +7,142 @@ import logging
 import threading
 import serial
 import serial.tools.list_ports
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from typing import Optional, Callable, Any, List, Union
+
+# Try to import pyudev, with fallback for Windows development
+try:
+    import pyudev
+    PYUDEV_AVAILABLE = True
+except ImportError:
+    PYUDEV_AVAILABLE = False
+    if sys.platform != 'win32':
+        raise  # Re-raise if not on Windows
+
+from config import USB_SETTINGS
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("usb-manager")
-
-class USBEventHandler(FileSystemEventHandler):
-    def __init__(self, callback):
-        self.callback = callback
-        
-    def on_created(self, event):
-        if event.is_directory:
-            return
-        if event.src_path.startswith('/dev/ttyUSB') or event.src_path.startswith('/dev/ttyACM'):
-            logger.info(f"New USB device detected: {event.src_path}")
-            self.callback(event.src_path)
-            
-    def on_deleted(self, event):
-        if event.is_directory:
-            return
-        if event.src_path.startswith('/dev/ttyUSB') or event.src_path.startswith('/dev/ttyACM'):
-            logger.info(f"USB device removed: {event.src_path}")
-            self.callback(event.src_path, removed=True)
+logger = logging.getLogger("usb")
 
 class USBManager:
-    def __init__(self):
-        self.connected_devices = {}
-        self.callback = None
-        self.observer = None
-        self.running = False
-        
-    def start_monitoring(self, callback):
-        """Start monitoring USB ports for ESP8266 devices"""
-        self.callback = callback
-        self.running = True
-        
-        # Start file system observer
-        event_handler = USBEventHandler(self._handle_device_change)
-        self.observer = Observer()
-        self.observer.schedule(event_handler, path='/dev', recursive=False)
-        self.observer.start()
-        
-        # Initial scan for connected devices
-        self._scan_ports()
-        
-        logger.info("USB monitoring started")
-        
-    def stop_monitoring(self):
-        """Stop monitoring USB ports"""
-        if self.observer:
-            self.observer.stop()
-            self.observer.join()
-        self.running = False
-        logger.info("USB monitoring stopped")
-        
-    def _scan_ports(self):
-        """Scan for connected ESP8266 devices"""
-        ports = list(serial.tools.list_ports.comports())
-        
-        for port in ports:
-            if self._is_esp8266(port):
-                self._handle_device_change(port.device)
-                
-    def _is_esp8266(self, port):
-        """Check if the port is likely an ESP8266 device"""
-        # Common USB-to-Serial converters used with ESP8266
-        if any(x in port.description for x in ["CP210", "CH340", "FTDI"]):
-            return True
-            
-        # Check for common port names
-        if any(x in port.device for x in ["ttyUSB", "ttyACM"]):
-            return True
-            
-        return False
-        
-    def _handle_device_change(self, port_path, removed=False):
-        """Handle device connection/disconnection"""
-        if removed:
-            if port_path in self.connected_devices:
-                del self.connected_devices[port_path]
-                if self.callback:
-                    self.callback(port_path, connected=False)
-        else:
-            if port_path not in self.connected_devices:
-                self.connected_devices[port_path] = {
-                    'connected': True,
-                    'last_seen': time.time()
-                }
-                if self.callback:
-                    self.callback(port_path, connected=True)
-                    
-    def get_connected_devices(self):
-        """Get list of currently connected ESP8266 devices"""
-        return list(self.connected_devices.keys())
-        
-    def is_device_connected(self, port_path):
-        """Check if a specific device is connected"""
-        return port_path in self.connected_devices
+    def __init__(self) -> None:
+        self.context: Optional[pyudev.Context] = None
+        self.monitor: Optional[pyudev.Monitor] = None
+        self.running: bool = False
 
-def main():
+    def start(self) -> bool:
+        if not PYUDEV_AVAILABLE:
+            logger.warning("pyudev not available. Running in limited mode.")
+            self.running = True
+            return True
+
+        try:
+            self.context = pyudev.Context()
+            self.monitor = pyudev.Monitor.from_netlink(self.context)
+            if self.monitor:
+                self.monitor.filter_by(subsystem=USB_SETTINGS["subsystem"])
+            self.running = True
+            logger.info("USB Manager started successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start USB Manager: {e}")
+            return False
+
+    def validate_device(self, device: Any) -> bool:
+        """Validate if the device is a supported ESP8266 board"""
+        if not PYUDEV_AVAILABLE:
+            return True  # Accept all devices in limited mode
+
+        try:
+            # Check if device has vendor and product IDs
+            if not device.get('ID_VENDOR_ID') or not device.get('ID_MODEL_ID'):
+                return False
+
+            # Get the vendor:product ID
+            device_id = f"{device.get('ID_VENDOR_ID')}:{device.get('ID_MODEL_ID')}"
+
+            # Check if it matches any known ESP8266 board IDs
+            return device_id in USB_SETTINGS["vendor_ids"].values()
+        except Exception as e:
+            logger.error(f"Error validating device: {e}")
+            return False
+
+    def monitor_devices(self, callback: Callable[[str, str], None]) -> None:
+        """Monitor USB devices with error handling and device validation"""
+        if not self.start():
+            logger.error("Cannot start device monitoring")
+            return
+
+        logger.info("Listening for serial device events...")
+
+        if not PYUDEV_AVAILABLE:
+            # Fallback for Windows development
+            logger.warning("Running in limited mode - using serial port polling")
+            while self.running:
+                try:
+                    ports = list(serial.tools.list_ports.comports())
+                    for port in ports:
+                        if any(x in port.device for x in ["ttyUSB", "ttyACM", "COM"]):
+                            callback("add", port.device)
+                    time.sleep(1)
+                except Exception as e:
+                    logger.error(f"Error in device polling: {e}")
+                    time.sleep(1)
+            return
+
+        if not self.monitor:
+            logger.error("Monitor not initialized")
+            return
+
+        try:
+            for device in iter(self.monitor.poll, None):
+                if device.action in ("add", "remove"):
+                    device_node = device.device_node
+                    
+                    if device.action == "add":
+                        if self.validate_device(device):
+                            logger.info(f"Valid ESP8266 device detected: {device_node}")
+                            callback(device.action, device_node)
+                        else:
+                            logger.debug(f"Ignoring unsupported device: {device_node}")
+                    else:  # remove
+                        logger.info(f"Device removed: {device_node}")
+                        callback(device.action, device_node)
+
+        except Exception as e:
+            logger.error(f"Error in device monitoring: {e}")
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        """Stop the USB manager"""
+        self.running = False
+        logger.info("USB Manager stopped")
+
+def monitor_usb_devices(callback: Callable[[str, str], None]) -> None:
+    """Wrapper function to maintain backward compatibility"""
+    manager = USBManager()
+    manager.monitor_devices(callback)
+
+def main() -> None:
     # Example usage
-    def device_callback(port_path, connected=True):
-        if connected:
-            logger.info(f"ESP8266 connected: {port_path}")
+    def device_callback(action: str, device_node: str) -> None:
+        if action == "add":
+            logger.info(f"ESP8266 connected: {device_node}")
         else:
-            logger.info(f"ESP8266 disconnected: {port_path}")
+            logger.info(f"ESP8266 disconnected: {device_node}")
     
     manager = USBManager()
-    manager.start_monitoring(device_callback)
+    manager.monitor_devices(device_callback)
     
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        manager.stop_monitoring()
+        manager.stop()
 
 if __name__ == "__main__":
     main() 
